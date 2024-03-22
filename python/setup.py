@@ -348,6 +348,7 @@ setuptools.setup(
         CMakeExtension('mujoco._rollout'),
         CMakeExtension('mujoco._simulate'),
         CMakeExtension('mujoco._structs'),
+        CMakeExtension('mujoco._simulation_pool')
     ],
     scripts=[
         'mujoco/mjpython/mjpython.py'

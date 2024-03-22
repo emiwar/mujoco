@@ -415,6 +415,9 @@ target_link_libraries(
           structs_header
 )
 
+mujoco_pybind11_module(_simulation_pool simulation_pool.cc)
+target_link_libraries(_simulation_pool PRIVATE functions_header mujoco raw)
+
 set(LIBRARIES_FOR_WHEEL
     "$<TARGET_FILE:_callbacks>"
     "$<TARGET_FILE:_constants>"
@@ -425,6 +428,7 @@ set(LIBRARIES_FOR_WHEEL
     "$<TARGET_FILE:_rollout>"
     "$<TARGET_FILE:_simulate>"
     "$<TARGET_FILE:_structs>"
+    "$<TARGET_FILE:_simulation_pool>"
     "$<TARGET_FILE:mujoco>"
 )
 
@@ -460,6 +464,7 @@ if(MUJOCO_PYTHON_MAKE_WHEEL)
     _rollout
     _simulate
     _structs
+    _simulation_pool
     mujoco
   )
   if(APPLE)
