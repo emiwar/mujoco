@@ -26,6 +26,7 @@ class SimulationPool {
         ~SimulationPool();
         void step();
         py::memoryview getState();
+        py::memoryview getSubtree_com();
         void setControl(py::array_t<mjtNum> new_control);
         void setReset(py::array_t<bool> new_reset_mask);
     private:
@@ -39,6 +40,7 @@ class SimulationPool {
         int ncontrol;
         mjtNum* control;
         mjtNum* state;
+        mjtNum* subtree_com;
         std::vector<bool> resetMask;
 
         std::mutex nextModelMutex;
@@ -62,6 +64,8 @@ SimulationPool::SimulationPool(const MjModelWrapper& py_mj_model, int nroll, int
     mju_zero(state, nroll * nstate);
     control = new mjtNum[nroll * ncontrol];
     mju_zero(control, nroll * ncontrol);
+    subtree_com = new mjtNum[nroll * model->nbody * 3];
+    mju_zero(subtree_com, nroll * model->nbody * 3);
     resetMask = std::vector<bool>(nroll, false);
     for(int i=0; i<nworkers; i++) {
         workers.emplace_back(std::thread(&SimulationPool::threadLoop, this));
@@ -75,6 +79,7 @@ SimulationPool::~SimulationPool() {
     }
     delete control;
     delete state;
+    delete subtree_com;
 }
 
 void SimulationPool::threadLoop() {
@@ -94,10 +99,12 @@ void SimulationPool::threadLoop() {
         if(resetMask[modelId]) {
             mj_resetData(model, data_obj);
         } else {
-            mju_copy(control + modelId*ncontrol, data_obj->ctrl, ncontrol);
+            mju_copy(data_obj->ctrl, control + modelId*ncontrol, ncontrol);
             mj_step(model, data_obj);
         }
         mj_getState(model, data_obj, state + modelId*nstate, mjSTATE_FULLPHYSICS);
+        
+        mju_copy(subtree_com + modelId*model->nbody * 3, data_obj->subtree_com, model->nbody * 3);
         {
             std::unique_lock<std::mutex> lock(completedMutex);
             completedModels++;
@@ -138,8 +145,8 @@ void SimulationPool::stopWorkers() {
 }
 
 py::memoryview SimulationPool::getState() {
-    long int nroll = data.size();
-    long int nstate = this->nstate;
+    const long int nroll = data.size();
+    const long int nstate = this->nstate;
     return py::memoryview::from_buffer(state, {nroll, nstate},
                                        {sizeof(mjtNum)*nstate, sizeof(mjtNum)}, true);
 }
@@ -162,13 +169,22 @@ void SimulationPool::setControl(py::array_t<mjtNum> new_control) {
 
 void SimulationPool::setReset(py::array_t<bool> new_reset_mask) {
     if(new_reset_mask.ndim() != 1 || new_reset_mask.shape()[0] != data.size()) {
-        throw std::runtime_error("Argument `reset_mask` must be an array with nroll elements.");
+        throw py::value_error("Argument `reset_mask` must be an array with nroll elements.");
     }
     //Don't know stride etc of new_reset_mask, so this is probably safest way to copy?
     auto r = new_reset_mask.unchecked<1>();
     for(int i=0; i<data.size(); i++) {
         resetMask[i] = r(i);
     }
+}
+
+py::memoryview SimulationPool::getSubtree_com() {
+    const long int nroll = data.size();
+    const long int three = 3;
+    const long int nbody = model->nbody;
+    return py::memoryview::from_buffer(subtree_com, {nroll, nbody, three},
+                                       {sizeof(mjtNum)*nbody*three, sizeof(mjtNum)*three, sizeof(mjtNum)},
+                                       true);
 }
 
 PYBIND11_MODULE(_simulation_pool, pymodule) {
@@ -178,7 +194,8 @@ PYBIND11_MODULE(_simulation_pool, pymodule) {
         .def("step", &SimulationPool::step, "Step all environments one step using the threadpool.")
         .def("getState", &SimulationPool::getState, "Get a memory view of the state (nroll x nstate).")
         .def("setControl", &SimulationPool::setControl, "Set the control inputs.", py::arg("new_control"))
-        .def("setReset", &SimulationPool::setReset, "Flag some simulations for resetting. Next time `step()` is called, these simulations will reset instead of stepping.", py::arg("reset_mask"));
+        .def("setReset", &SimulationPool::setReset, "Flag some simulations for resetting. Next time `step()` is called, these simulations will reset instead of stepping.", py::arg("reset_mask"))
+        .def("getSubtree_com", &SimulationPool::getSubtree_com, "Get a memory view of the subtree bodies center-of-mass (nroll x nbody x 3).");
 }
 
 }
