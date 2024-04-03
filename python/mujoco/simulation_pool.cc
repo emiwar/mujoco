@@ -98,18 +98,18 @@ void SimulationPool::threadLoop() {
         mjData* data_obj = data[modelId];
         if(resetMask[modelId]) {
             mj_resetData(model, data_obj);
+            mju_copy(data_obj->ctrl, control + modelId*ncontrol, ncontrol);
         } else {
             mju_copy(data_obj->ctrl, control + modelId*ncontrol, ncontrol);
             mj_step(model, data_obj);
         }
         mj_getState(model, data_obj, state + modelId*nstate, mjSTATE_FULLPHYSICS);
-        
         mju_copy(subtree_com + modelId*model->nbody * 3, data_obj->subtree_com, model->nbody * 3);
         {
             std::unique_lock<std::mutex> lock(completedMutex);
             completedModels++;
             if(completedModels >= data.size()) {
-                allCompleted.notify_one();
+                allCompleted.notify_all();
             }
         }
     }
