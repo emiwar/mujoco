@@ -24,7 +24,7 @@ namespace {
 namespace py = ::pybind11;
 
 enum ThreadOperation {
-    STEP=0, RESET=1
+    STEP=0, RESET=1, MULTISTEP=2
 };
 
 class SimulationPool {
@@ -33,6 +33,7 @@ class SimulationPool {
                        std::optional<mjtState> stateRep);
         ~SimulationPool();
         void step();
+        void multistep(int nsteps);
         py::memoryview getState();
         py::memoryview getSubtree_com();
         void setControl(py::array_t<mjtNum> new_control);
@@ -57,6 +58,7 @@ class SimulationPool {
         mjtNum* subtree_com;
         std::vector<bool> resetMask;
         int threadOperation = 0;
+        int nmultisteps = 1;
 
         std::mutex nextModelMutex;
         std::condition_variable nextModelAvailable;
@@ -134,6 +136,13 @@ void SimulationPool::threadLoop() {
             mj_step(model, data_obj);
             mj_getState(model, data_obj, state + modelId*nstate, stateBitmask);
             mju_copy(subtree_com + modelId*model->nbody * 3, data_obj->subtree_com, model->nbody * 3);
+        } else if (threadop == MULTISTEP) {
+            mju_copy(data_obj->ctrl, control + modelId*ncontrol, ncontrol);
+            for(int t=0; t<nmultisteps; t++) {
+                mj_step(model, data_obj);
+            }
+            mj_getState(model, data_obj, state + modelId*nstate, stateBitmask);
+            mju_copy(subtree_com + modelId*model->nbody * 3, data_obj->subtree_com, model->nbody * 3);
         }
         {
             std::unique_lock<std::mutex> lock(completedMutex);
@@ -165,6 +174,11 @@ void SimulationPool::multithreadedTask(int operation) {
 
 void SimulationPool::step() {
     multithreadedTask(STEP);
+}
+
+void SimulationPool::multistep(int nsteps) {
+    nmultisteps = nsteps;
+    multithreadedTask(MULTISTEP);
 }
 
 void SimulationPool::stopWorkers() {
@@ -279,6 +293,7 @@ PYBIND11_MODULE(_simulation_pool, pymodule) {
         .def(py::init<const MjModelWrapper&, int, int, std::optional<mjtState>>(),
              py::arg("model"), py::arg("nroll"), py::arg("nworkers"), py::arg("stateRepr"))
         .def("step", &SimulationPool::step, "Step all environments one step using the threadpool.")
+        .def("multistep", &SimulationPool::multistep, "Step all environments `nsteps` steps using the threadpool.", py::arg("nsteps"))
         .def("getState", &SimulationPool::getState, "Get a memory view of the state (nroll x nstate).")
         .def("setControl", &SimulationPool::setControl, "Set the control inputs.", py::arg("new_control"))
         .def("reset", &SimulationPool::reset, "Reset the simulations for which `reset_mask` is True.", py::arg("reset_mask"))
