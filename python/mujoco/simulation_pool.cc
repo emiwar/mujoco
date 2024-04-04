@@ -6,13 +6,16 @@
 #include <condition_variable>
 
 #include <mujoco/mujoco.h>
+//#include "../render/glad/glad.h"
 #include "errors.h"
 #include "raw.h"
 #include "structs.h"
+
 #include <pybind11/buffer_info.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+
 
 namespace mujoco::python {
 
@@ -26,23 +29,27 @@ enum ThreadOperation {
 
 class SimulationPool {
     public:
-        SimulationPool(const MjModelWrapper& py_mj_model, int nroll, int nworkers);
+        SimulationPool(const MjModelWrapper& py_mj_model, int nroll, int nworkers,
+                       std::optional<mjtState> stateRep);
         ~SimulationPool();
         void step();
         py::memoryview getState();
         py::memoryview getSubtree_com();
         void setControl(py::array_t<mjtNum> new_control);
         void reset(py::array_t<bool> new_reset_mask);
-        void renderAll(py::array_t<unsigned char> out);
+        void renderAll(py::array_t<unsigned char> out, std::string camera_name);
+        void enableRendering(py::object GlContext, int render_width, int render_height, const MjvOptionWrapper& py_mj_options);
+        void setSceneFlag(mjtRndFlag flag, bool new_value);
     private:
         void threadLoop();
         void multithreadedTask(int operation);
         void stopWorkers();
-        //void initRender();
 
         const mjModel* model;
         std::vector<mjData*> data;
         std::vector<std::thread> workers;
+
+        mjtState stateBitmask;
         int nstate;
         int ncontrol;
         mjtNum* control;
@@ -67,14 +74,17 @@ class SimulationPool {
         mjrContext con;
         int render_width = 64;
         int render_height = 64;
+        bool canRender = false;
 };
 
 
-SimulationPool::SimulationPool(const MjModelWrapper& py_mj_model, int nroll, int nworkers) : model(py_mj_model.get()) {
+SimulationPool::SimulationPool(const MjModelWrapper& py_mj_model, int nroll, int nworkers,
+                               std::optional<mjtState> stateRep) : model(py_mj_model.get()) {
     for(int i=0; i<nroll; i++) {
         data.push_back(mj_makeData(model));
     }
-    nstate = mj_stateSize(model, mjSTATE_FULLPHYSICS);
+    stateBitmask = stateRep ? stateRep.value() : mjSTATE_FULLPHYSICS;
+    nstate = mj_stateSize(model, stateBitmask);
     ncontrol = mj_stateSize(model, mjSTATE_CTRL);
     state = new mjtNum[nroll * nstate];
     mju_zero(state, nroll * nstate);
@@ -86,7 +96,6 @@ SimulationPool::SimulationPool(const MjModelWrapper& py_mj_model, int nroll, int
     for(int i=0; i<nworkers; i++) {
         workers.emplace_back(std::thread(&SimulationPool::threadLoop, this));
     }
-    //initRender();
 }
 
 SimulationPool::~SimulationPool() {
@@ -98,18 +107,6 @@ SimulationPool::~SimulationPool() {
     delete state;
     delete subtree_com;
 }
-
-/*void SimulationPool::initRender() {
-    mjv_defaultCamera(&cam);
-    mjv_defaultOption(&opt);
-    mjv_defaultScene(&scn);
-    mjr_defaultContext(&con);
-
-    // create scene and context
-    mjv_makeScene(model, &scn, 10000);
-    mjr_makeContext(model, &con, mjFONTSCALE_150);
-    mjr_setBuffer(mjFB_OFFSCREEN, &con);
-}*/
 
 void SimulationPool::threadLoop() {
     while(true) {
@@ -130,12 +127,12 @@ void SimulationPool::threadLoop() {
         if(threadop == RESET && resetMask[modelId]) {
             mj_resetData(model, data_obj);
             mju_copy(data_obj->ctrl, control + modelId*ncontrol, ncontrol);
-            mj_getState(model, data_obj, state + modelId*nstate, mjSTATE_FULLPHYSICS);
+            mj_getState(model, data_obj, state + modelId*nstate, stateBitmask);
             mju_copy(subtree_com + modelId*model->nbody * 3, data_obj->subtree_com, model->nbody * 3);
         } else if (threadop == STEP) {
             mju_copy(data_obj->ctrl, control + modelId*ncontrol, ncontrol);
             mj_step(model, data_obj);
-            mj_getState(model, data_obj, state + modelId*nstate, mjSTATE_FULLPHYSICS);
+            mj_getState(model, data_obj, state + modelId*nstate, stateBitmask);
             mju_copy(subtree_com + modelId*model->nbody * 3, data_obj->subtree_com, model->nbody * 3);
         }
         {
@@ -226,34 +223,70 @@ py::memoryview SimulationPool::getSubtree_com() {
                                        true);
 }
 
-void SimulationPool::renderAll(py::array_t<unsigned char> out) {
+void SimulationPool::enableRendering(py::object GlContext,
+                                     int render_width, int render_height,
+                                     const MjvOptionWrapper& py_mjv_options) {
+    GlContext.attr("make_current")();
+    this->render_width = render_width;
+    this->render_height = render_height;
+    mjv_defaultCamera(&cam);
+    opt = *(py_mjv_options.get());
+    mjv_defaultScene(&scn);
+    mjr_defaultContext(&con);
+
+    // create scene and context
+    mjv_makeScene(model, &scn, 10000);
+    mjr_makeContext(model, &con, mjFONTSCALE_150);
+    mjr_setBuffer(mjFB_OFFSCREEN, &con);
+    con.readDepthMap = mjDEPTH_ZEROFAR;
+    canRender = true;
+}
+
+void SimulationPool::setSceneFlag(mjtRndFlag flag, bool new_value) {
+    scn.flags[flag] = new_value;
+}
+
+void SimulationPool::renderAll(py::array_t<unsigned char> out, std::string camera_name) {
+    if(!canRender) {
+        throw py::value_error("Rendering not enabled. Must call `enableRendering(...)` first.");
+    }
     if(out.ndim() != 3) {
         throw py::value_error("Argument `out` must be 3-dim array.");
     }
-    if(out.shape()[0] != data.size()*render_width ||
-       out.shape()[1] != render_height ||
+    if(out.shape()[0] != data.size()*render_height ||
+       out.shape()[1] != render_width ||
        out.shape()[2] != 3) {
-        throw py::value_error("Argument `out` must have dimensions (64*nroll) x 64 x 3.");
+        throw py::value_error("Argument `out` must have dimensions (render_height*nroll) x render_width x 3.");
     }
+    int camera_id = mj_name2id(model, mjOBJ_CAMERA, camera_name.c_str());
+    if (camera_id == -1) {
+        throw py::value_error("Could not find camera with specified name.");
+    }
+    cam.fixedcamid = camera_id;
+    cam.type = mjCAMERA_FIXED;
     for(int i=0; i<data.size(); i++) {
-        mjrRect viewport = {render_width*i, 0, render_width, render_height};
+        mjrRect viewport = {0, render_height*i, render_width, render_height};
         mjv_updateScene(model, data[i], &opt, NULL, &cam, mjCAT_ALL, &scn);
         mjr_render(viewport, &scn, &con);
     }
-    mjrRect full_size = {render_width*(int)data.size(), 0, render_width, render_height};
+    mjrRect full_size = {0, 0, render_width, render_height*(int)data.size()};
     mjr_readPixels(out.mutable_data(), NULL, full_size, &con);
 }
 
 PYBIND11_MODULE(_simulation_pool, pymodule) {
     namespace py = ::pybind11;
     py::class_<SimulationPool>(pymodule, "SimulationPool")
-        .def(py::init<const MjModelWrapper&, int, int>(), py::arg("model"), py::arg("nroll"), py::arg("nworkers"))
+        .def(py::init<const MjModelWrapper&, int, int, std::optional<mjtState>>(),
+             py::arg("model"), py::arg("nroll"), py::arg("nworkers"), py::arg("stateRepr"))
         .def("step", &SimulationPool::step, "Step all environments one step using the threadpool.")
         .def("getState", &SimulationPool::getState, "Get a memory view of the state (nroll x nstate).")
         .def("setControl", &SimulationPool::setControl, "Set the control inputs.", py::arg("new_control"))
         .def("reset", &SimulationPool::reset, "Reset the simulations for which `reset_mask` is True.", py::arg("reset_mask"))
         .def("getSubtree_com", &SimulationPool::getSubtree_com, "Get a memory view of the subtree bodies center-of-mass (nroll x nbody x 3).")
-        .def("renderAll", &SimulationPool::renderAll, "Render all environments to array out.", py::arg("out"));
+        .def("enableRendering", &SimulationPool::enableRendering, "Prepare the simulation pool for batch rendering.",
+                py::arg("glContext"), py::arg("render_width"), py::arg("render_height"), py::arg("mjv_options"))
+        .def("setSceneFlag", &SimulationPool::setSceneFlag, "Set a flag on the rendering scene.", py::arg("flag"), py::arg("new_value"))
+        .def("renderAll", &SimulationPool::renderAll, "Render all environments to array out.", py::arg("out"), py::arg("camera_name"));
 }
 
 }
